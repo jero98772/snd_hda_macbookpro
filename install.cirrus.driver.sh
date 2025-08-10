@@ -18,7 +18,7 @@ do
 done
 
 UNAME=${1:-$(uname -r)}
-kernel_version=$(echo $UNAME | cut -d '-' -f1)  #ie 5.2.7
+kernel_version=$(echo $UNAME | cut -d '-' -f1)  #ie 6.16.0
 major_version=$(echo $kernel_version | cut -d '.' -f1)
 minor_version=$(echo $kernel_version | cut -d '.' -f2)
 major_minor=${major_version}${minor_version}
@@ -53,10 +53,12 @@ fi
 
 if [ $major_version == '4' ]; then
 	echo "Kernel 4 versions no longer supported"
+	exit 1
 fi
 
 if [ $major_version -eq 5 -a $minor_version -lt 8 ]; then
 	echo "Kernel 5 versions less than 5.8 no longer supported"
+	exit 1
 fi
 
 isdebian=0
@@ -94,7 +96,6 @@ else
 	echo "Void Linux: xbps-install -S linux-headers"
 
 	exit 1
-
 fi
 
 # note that the update_dir definition below relies on a symbolic link of /lib to /usr/lib on Arch
@@ -113,6 +114,13 @@ if [ $isfedora -ge 1 ]; then
 	[[ ! $(command -v patch) ]] && dnf install -y patch
 fi
 
+# Check if this is a T2 kernel (MacBook kernel) or other custom kernel
+ist2kernel=0
+if [[ $UNAME == *"t2"* ]]; then
+    ist2kernel=1
+    echo "Detected T2 kernel (MacBook kernel): $UNAME"
+fi
+
 # we need to handle Ubuntu based distributions eg Mint here
 isubuntu=0
 if [ $(grep '^NAME=' /etc/os-release | grep -c Ubuntu) -eq 1 ]; then
@@ -122,7 +130,8 @@ if [ $(grep '^NAME=' /etc/os-release | grep -c "Linux Mint") -eq 1 ]; then
 	isubuntu=1
 fi
 
-if [ $isubuntu -ge 1 ]; then
+# For T2 kernels or other custom kernels, skip the Ubuntu source package logic
+if [ $isubuntu -ge 1 ] && [ $ist2kernel -eq 0 ]; then
 
 	# NOTE for Ubuntu we need to use the distribution kernel sources as they seem
 	# to be significantly modified from the mainline kernel sources generally with backports from later kernels
@@ -138,54 +147,93 @@ if [ $isubuntu -ge 1 ]; then
 		echo "assuming the linux kernel source package is not installed"
 		echo "please install the linux kernel source package:"
 		echo "sudo apt install linux-source-$kernel_version"
-		echo "NOTE - This does not work for HWE kernels"
+		echo "NOTE - This does not work for HWE kernels or custom kernels like T2"
+		echo "For T2 kernels, the script will use mainline kernel sources instead"
 
-		exit 1
-
+		# For T2 kernels, fall through to mainline kernel download
+		if [ $ist2kernel -eq 0 ]; then
+			exit 1
+		fi
+	else
+		# Ubuntu source package found, use it
+		tar --strip-components=3 -xvf /usr/src/linux-source-$kernel_version.tar.bz2 --directory=build/ linux-source-$kernel_version/sound/pci/hda
+		ubuntu_source_used=1
 	fi
+fi
 
-	tar --strip-components=3 -xvf /usr/src/linux-source-$kernel_version.tar.bz2 --directory=build/ linux-source-$kernel_version/sound/pci/hda
-
-else
-	# here we assume the distribution kernel source is essentially the mainline kernel source
+# If we didn't use Ubuntu sources (T2 kernel, other distros, or Ubuntu source not found)
+if [[ ! ${ubuntu_source_used:-0} -eq 1 ]]; then
+	# here we assume we need to download mainline kernel source
+	echo "Using mainline kernel sources for kernel $kernel_version"
 
 	set +e
 
-	# attempt to download linux-x.x.x.tar.xz kernel
-	wget -c https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_version.tar.xz -P $build_dir
+	# For newer kernels (6.x), we may need to try different approaches
+	if [ $major_version -ge 6 ]; then
+		echo "Kernel 6.x detected - using best-match mainline kernel source"
+		
+		# Try exact version first
+		wget -c https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_version.tar.xz -P $build_dir
+		
+		if [[ $? -ne 0 ]]; then
+			echo "Failed to download linux-$kernel_version.tar.xz"
+			
+			# Try without patch version (e.g., 6.16.0 -> 6.16)
+			base_version="$major_version.$minor_version"
+			echo "Trying base version linux-$base_version.tar.xz"
+			kernel_version=$base_version
+			wget -c https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_version.tar.xz -P $build_dir
+			
+			if [[ $? -ne 0 ]]; then
+				# Try latest stable in the major version
+				echo "Trying to find latest available kernel in v$major_version.x series"
+				latest_kernel=$(curl -s https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/ | grep -oP 'linux-\K[0-9]+\.[0-9]+(\.[0-9]+)?(?=\.tar\.xz)' | sort -V | tail -1)
+				if [ ! -z "$latest_kernel" ]; then
+					echo "Using latest available kernel: linux-$latest_kernel.tar.xz"
+					kernel_version=$latest_kernel
+					wget -c https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_version.tar.xz -P $build_dir
+				fi
+				
+				[[ $? -ne 0 ]] && echo "Could not download any suitable kernel source...exiting" && exit 1
+			fi
+		fi
+	else
+		# Original logic for older kernels
+		# attempt to download linux-x.x.x.tar.xz kernel
+		wget -c https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_version.tar.xz -P $build_dir
 
-	if [[ $? -ne 0 ]]; then
-		echo "Failed to download linux-$kernel_version.tar.xz"
-		echo "Trying to download base kernel version linux-$major_version.$minor_version.tar.xz"
-		echo "This may lead to build failures as too old"
-		echo "If this is an Ubuntu-based distribution this almost certainly will fail to build"
-		echo ""
-   		# if first attempt fails, attempt to download linux-x.x.tar.xz kernel
-   		kernel_version=$major_version.$minor_version
-   		wget -c https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_version.tar.xz -P $build_dir
+		if [[ $? -ne 0 ]]; then
+			echo "Failed to download linux-$kernel_version.tar.xz"
+			echo "Trying to download base kernel version linux-$major_version.$minor_version.tar.xz"
+			echo "This may lead to build failures as too old"
+			echo "If this is an Ubuntu-based distribution this almost certainly will fail to build"
+			echo ""
+			# if first attempt fails, attempt to download linux-x.x.tar.xz kernel
+			kernel_version=$major_version.$minor_version
+			wget -c https://cdn.kernel.org/pub/linux/kernel/v$major_version.x/linux-$kernel_version.tar.xz -P $build_dir
 
-		[[ $? -ne 0 ]] && echo "kernel could not be downloaded...exiting" && exit
+			[[ $? -ne 0 ]] && echo "kernel could not be downloaded...exiting" && exit
+		fi
 	fi
 
 	set -e
 
 	tar --strip-components=3 -xvf $build_dir/linux-$kernel_version.tar.xz --directory=build/ linux-$kernel_version/sound/pci/hda
-
 fi
 
 mv $hda_dir/Makefile $hda_dir/Makefile.orig
 cp $patch_dir/Makefile $patch_dir/patch_cirrus_* $hda_dir
 pushd $hda_dir > /dev/null
-# define the ubuntu/mainline versions that work at the moment
-# for ubuntu allow a range of revisions that work
-current_major=5
-current_minor=19
+
+# Updated version definitions for newer kernels
+current_major=6
+current_minor=16
 current_minor_ubuntu=15
 current_rev_ubuntu=47
 latest_rev_ubuntu=71
 
 iscurrent=0
-if [ $isubuntu -ge 1 ]; then
+if [ $isubuntu -ge 1 ] && [ $ist2kernel -eq 0 ]; then
 	if [ $major_version -gt $current_major ]; then
 		iscurrent=2
 	elif [ $major_version -eq $current_major -a $minor_version -gt $current_minor_ubuntu ]; then
@@ -200,14 +248,15 @@ if [ $isubuntu -ge 1 ]; then
 		iscurrent=-1
 	fi
 else
+	# For non-Ubuntu or T2 kernels, use more permissive logic
 	if [ $major_version -gt $current_major ]; then
-		iscurrent=2
+		iscurrent=1  # Assume current for newer major versions
 	elif [ $major_version -eq $current_major -a $minor_version -gt $current_minor ]; then
-		iscurrent=2
+		iscurrent=1  # Assume current for newer minor versions
 	elif [ $major_version -eq $current_major -a $minor_version -eq $current_minor ]; then
 		iscurrent=1
 	else
-		iscurrent=-1
+		iscurrent=0  # Older versions but still try to build
 	fi
 fi
 
@@ -218,7 +267,7 @@ fi
 if [ $major_version -eq 5 -a $minor_version -lt 13 ]; then
 	patch -b -p2 <../../patch_patch_cirrus.c.diff
 else
-	if [ $isubuntu -ge 1 ]; then
+	if [ $isubuntu -ge 1 ] && [ $ist2kernel -eq 0 ]; then
 
 		patch -b -p2 <../../patch_patch_cs8409.c.diff
 
@@ -233,6 +282,7 @@ else
 		fi
 
 	else
+		# For T2 kernels and other non-Ubuntu distributions
 		patch -b -p2 <../../patch_patch_cs8409.c.diff
 
 		if [ $iscurrent -ge 0 ]; then
@@ -246,7 +296,6 @@ else
 		if [ $iscurrent -ge 0 ]; then
 			patch -b -p2 <../../patch_patch_cirrus_apple.h.diff
 		fi
-
 	fi
 fi
 
@@ -257,11 +306,9 @@ popd > /dev/null
 if [ $PATCH_CIRRUS = true ]; then
 	make PATCH_CIRRUS=1
 	make install PATCH_CIRRUS=1
-
 else
 	make KERNELRELEASE=$UNAME
 	make install KERNELRELEASE=$UNAME
-
 fi
 
 echo -e "\ncontents of $update_dir"
