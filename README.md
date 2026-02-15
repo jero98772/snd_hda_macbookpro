@@ -85,3 +85,10 @@ sudo ./install.cirrus.driver.sh
 
 reboot
 ```
+# Touchbar
+
+if you have a A1707 like me and you dont find a tutorial setup the touch bar , this chat help me 
+[Claude](https://claude.ai/share/766bfa26-2882-4394-af5d-5ce8cfef287c)
+
+
+
