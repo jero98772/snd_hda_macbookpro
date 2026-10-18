@@ -1,0 +1,102 @@
+#!/bin/bash
+# =====================================================================
+# Fix internal Broadcom BCM43602 Wi-Fi locked to 2.4 GHz
+# Machine: MacBookPro14,3  /  Ubuntu 25.10  /  iface wlp3s0
+#
+# Problem: /usr/lib/firmware/brcm/brcmfmac43602-pcie.txt is 0 bytes and
+#          owned by no package. brcmfmac fails to parse it (error -22),
+#          so the chip comes up in regulatory country 99 with no 5 GHz
+#          band. The AP "HiBreak" is 5 GHz-only (ch 153), hence the
+#          USB adapter being the only thing that works.
+#
+# Safety: touches ONLY brcmfmac. The USB adapter (rtw88_8821cu) and all
+#         docker/calico bridges are never referenced. Fully reversible;
+#         see UNDO at the bottom.
+# =====================================================================
+set -u
+
+F=/usr/lib/firmware/brcm/brcmfmac43602-pcie.txt
+BAK="$F.broken-empty.bak"
+IFACE=wlp3s0
+PHY=phy0
+REGDOM=CO          # Colombia, matches the current global regulatory domain
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+bands(){ iw phy "$PHY" info 2>/dev/null | grep -E '^[[:space:]]+Band [0-9]:' | tr -d '\t'; }
+has5g(){ iw phy "$PHY" info 2>/dev/null | grep -qE '^[[:space:]]+Band 2:'; }
+
+[ "$(id -u)" -eq 0 ] || die "must run as root:  sudo $0"
+
+echo "=========== BEFORE ==========="
+echo "bands:      $(bands | paste -sd' ')"
+echo "regulatory: $(iw reg get 2>/dev/null | grep -A1 'phy#0' | tail -1 | xargs)"
+echo "MAC:        $(cat /sys/class/net/$IFACE/address 2>/dev/null)"
+echo
+
+# --- Step 1: remove the bogus empty NVRAM file -----------------------
+if [ -e "$F" ] && [ ! -s "$F" ]; then
+    mv -v "$F" "$BAK" || die "could not move $F"
+    echo "[1] empty NVRAM moved aside"
+elif [ -s "$F" ]; then
+    echo "[1] SKIP: $F has real content ($(stat -c%s "$F") bytes) - leaving it alone"
+else
+    echo "[1] SKIP: already removed in a previous run"
+fi
+
+# --- Step 2: reload brcmfmac (and nothing else) ----------------------
+echo "[2] reloading brcmfmac..."
+modprobe -r brcmfmac_wcc 2>/dev/null
+if ! modprobe -r brcmfmac 2>/dev/null; then
+    echo "    unload failed (module busy). Reboot and re-run; the file fix above persists."
+    exit 1
+fi
+modprobe brcmfmac || die "failed to reload brcmfmac - reboot to recover"
+echo "    waiting for $IFACE..."
+for i in $(seq 1 15); do [ -e "/sys/class/net/$IFACE" ] && break; sleep 1; done
+sleep 3
+
+# --- Step 3: nudge the regulatory domain if still unset --------------
+if ! has5g; then
+    echo "[3] no 5 GHz band yet - forcing regulatory domain $REGDOM"
+    iw reg set "$REGDOM" 2>/dev/null
+    sleep 3
+else
+    echo "[3] 5 GHz band present, no regulatory nudge needed"
+fi
+
+# --- Results ---------------------------------------------------------
+echo
+echo "=========== AFTER ==========="
+echo "bands:      $(bands | paste -sd' ')"
+echo "regulatory: $(iw reg get 2>/dev/null | grep -A1 'phy#0' | tail -1 | xargs)"
+echo "MAC:        $(cat /sys/class/net/$IFACE/address 2>/dev/null)"
+echo "kernel:"; dmesg | grep -i brcmfmac | tail -8 | sed 's/^/    /'
+echo "USB adapter (must still be connected):"
+nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep wlx | sed 's/^/    /'
+echo
+
+if has5g; then
+    echo ">>> SUCCESS: 5 GHz band is available on $IFACE."
+    echo ">>> Scanning for HiBreak..."
+    nmcli device wifi rescan ifname "$IFACE" 2>/dev/null; sleep 5
+    if nmcli -t -f SSID device wifi list ifname "$IFACE" 2>/dev/null | grep -qi '^HiBreak$'; then
+        echo ">>> HiBreak is visible. Connect with:"
+        echo "      nmcli device wifi connect HiBreak ifname $IFACE"
+    else
+        echo ">>> HiBreak not seen yet; try: nmcli device wifi list ifname $IFACE"
+    fi
+else
+    echo ">>> STILL 2.4 GHz ONLY."
+    echo ">>> Next: full COLD BOOT (shutdown -h now, then power on)."
+    echo "    OTP calibration data is read at chip power-on; a warm reboot"
+    echo "    may not power-cycle the PCIe device. Re-run this script after."
+fi
+
+cat <<UNDO
+
+--------------------------------------------------------------------
+UNDO (restores the original state exactly):
+  sudo mv "$BAK" "$F"
+  sudo modprobe -r brcmfmac && sudo modprobe brcmfmac
+--------------------------------------------------------------------
+UNDO
