@@ -1,0 +1,58 @@
+
+
+
+# ======================
+# IPV6
+# ======================
+[ipv6]
+command="i3status-rs --ipv6"   # Optional, or skip
+
+# ======================
+# WIRELESS
+# ======================
+[wireless]
+command=/bin/bash -c "nmcli -t -f ACTIVE,SSID dev wifi | grep '^yes' | cut -d: -f2"
+interval=5
+
+# ======================
+# ETHERNET
+# ======================
+[ethernet]
+command="ip addr show | grep 'inet ' | awk '{print \$2}'"
+interval=5
+
+# ======================
+# BATTERY
+# ======================
+[battery]
+command=acpi -b | awk '{print $3, $4}'
+interval=30
+
+# ======================
+# DISK
+# ======================
+[disk]
+command="df -h / | tail -1 | awk '{print \$4}'"
+interval=60
+
+# ======================
+# LOAD
+# ======================
+[load]
+command=uptime | awk -F'load average:' '{print \$2}'
+interval=10
+
+# ======================
+# MEMORY
+# ======================
+[memory]
+command=free -h | awk '/Mem:/ {print \$3 \" / \" \$2}'
+interval=10
+
+# ======================
+# TIME
+# ======================
+[tztime local]
+command=date '+%Y-%m-%d %H:%M:%S'
+interval=1
+

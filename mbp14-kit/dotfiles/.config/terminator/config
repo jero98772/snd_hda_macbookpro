@@ -1,0 +1,16 @@
+[global_config]
+  enabled_plugins = CustomCommandsMenu, LaunchpadBugURLHandler, LaunchpadCodeURLHandler, APTURLHandler
+[keybindings]
+[profiles]
+  [[default]]
+    background_type = image
+    background_image = /home/jero98772/Pictures/2.jpeg
+[layouts]
+  [[default]]
+    [[[window0]]]
+      type = Window
+      parent = ""
+    [[[child1]]]
+      type = Terminal
+      parent = window0
+[plugins]

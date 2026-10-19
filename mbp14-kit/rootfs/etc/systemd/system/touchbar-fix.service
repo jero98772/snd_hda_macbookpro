@@ -1,0 +1,14 @@
+[Unit]
+Description=MacBook Touchbar Fix
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 5
+ExecStart=/bin/bash -c 'echo 1-3 > /sys/bus/usb/drivers/usb/unbind || true'
+ExecStart=/bin/sleep 2
+ExecStart=/bin/bash -c 'echo 1-3 > /sys/bus/usb/drivers/usb/bind || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

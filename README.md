@@ -94,3 +94,9 @@ The code related to touchbar from claude, for fix it
   
     bash touchbar_script.sh
 
+If the Touch Bar stays dark even though `apple_ib_tb` is loaded, check which driver owns the iBridge HID interfaces:
+
+    ls -l /sys/bus/hid/devices/*/driver
+
+If one of the `05AC:8600` devices is bound to `hid-sensor-hub`, the Touch Bar driver can't get the interface it needs to turn the bar on. The script blacklists `hid_sensor_hub` to prevent that (the light sensor still works through `apple_ib_als`).
+

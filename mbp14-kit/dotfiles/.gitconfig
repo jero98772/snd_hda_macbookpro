@@ -1,0 +1,9 @@
+[user]
+	name = jero98772
+	email = jero98772@protonmail.com
+[credential "https://github.com"]
+	helper = 
+	helper = !/usr/bin/gh auth git-credential
+[credential "https://gist.github.com"]
+	helper = 
+	helper = !/usr/bin/gh auth git-credential

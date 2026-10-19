@@ -1,0 +1,15 @@
+[Unit]
+Description=MacBookPro14,3 kit: user groups, dotfiles and apps on first boot
+Wants=network-online.target
+After=network-online.target snapd.seeded.service
+ConditionPathExists=!/var/lib/mbp14-kit/firstboot.done
+
+[Service]
+Type=oneshot
+ExecStart=/opt/mbp14-kit/install.sh
+ExecStartPost=/bin/sh -c 'mkdir -p /var/lib/mbp14-kit && touch /var/lib/mbp14-kit/firstboot.done'
+StandardOutput=journal+console
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

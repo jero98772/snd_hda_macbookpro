@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+#
+# mbp-suspend-fix.sh — Lid-close standby with lock screen for MacBookPro14,3 on Linux.
+#
+# Problem:  Kernel suspend hangs at "PM: suspend entry" on this machine (both deep and
+#           s2idle), so a closed lid means a frozen laptop and a forced reboot.
+# Fix:      Never enter kernel suspend. Lid events are handled by an event-driven daemon:
+#             lid closed -> lock session (xss-lock/i3lock), display off, panel and
+#                           keyboard backlight off, CPU and Wi-Fi in power-save.
+#             lid opened -> restore everything and light the screen with i3lock waiting;
+#                           touch the touchpad / any key, unlock, and the session is back.
+#           With an external monitor connected only the internal panel is switched off.
+#           Every suspend path is disabled so nothing can trigger the hang, and the
+#           critical-battery action is set to power-off.
+#           The AMD dGPU is never unloaded or disabled; it stays available for compute.
+#
+# Usage:    sudo mbp-suspend-fix.sh install | uninstall | status | standby | wake
+#
+set -euo pipefail
+
+readonly NAME="mbp-suspend-fix"
+readonly TAG="mbp-lid-standby"
+readonly SUPPORTED_MODEL="MacBookPro14,3"
+
+readonly SELF_DST="/usr/local/sbin/${NAME}"
+readonly SERVICE="/etc/systemd/system/${TAG}.service"
+readonly SLEEP_CONF="/etc/systemd/sleep.conf.d/mbp.conf"
+readonly LOGIND_CONF="/etc/systemd/logind.conf.d/mbp-lid.conf"
+readonly UPOWER_CONF="/etc/UPower/UPower.conf"
+readonly BACKUP_DIR="/var/backups/${NAME}"
+readonly STATE="/run/${TAG}.state"
+
+# Left behind by earlier versions of this script.
+readonly OLD_HOOK="/usr/lib/systemd/system-sleep/mbp-suspend"
+readonly OLD_SERVICE="/etc/systemd/system/${NAME}.service"
+readonly LEGACY_SERVICE="/etc/systemd/system/macbook-suspend.service"
+
+readonly BACKLIGHT="/sys/class/backlight/gmux_backlight"
+readonly KBD_LED="/sys/class/leds/spi::kbd_backlight"
+readonly BATTERY="/sys/class/power_supply/BAT0"
+readonly LID_STATE="/proc/acpi/button/lid/LID0/state"
+
+log()  { printf '\033[1;34m[%s]\033[0m %s\n' "$NAME" "$*"; }
+warn() { printf '\033[1;33m[%s] WARN:\033[0m %s\n' "$NAME" "$*" >&2; }
+die()  { printf '\033[1;31m[%s] ERROR:\033[0m %s\n' "$NAME" "$*" >&2; exit 1; }
+jlog() { logger -t "$TAG" -- "$*"; }
+
+require_root() { [[ $EUID -eq 0 ]] || die "Run as root: sudo $0 ${1:-install}"; }
+
+require_model() {
+    local model
+    model=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo unknown)
+    [[ $model == "$SUPPORTED_MODEL" ]] || die "Unsupported model '$model' (expected $SUPPORTED_MODEL)."
+}
+
+backup() {
+    local f=$1
+    [[ -e $f ]] || return 0
+    mkdir -p "$BACKUP_DIR"
+    [[ -e $BACKUP_DIR/$(basename "$f") ]] || cp -a "$f" "$BACKUP_DIR/"
+}
+
+# --- helpers --------------------------------------------------------------------
+
+rd() { cat "$1" 2>/dev/null || true; }
+wr() { if [[ -w $1 ]]; then echo "$2" > "$1" 2>/dev/null || true; fi; }
+
+wifi_iface() {
+    local n
+    for n in /sys/class/net/wl*; do
+        if [[ -e $n ]]; then basename "$n"; return 0; fi
+    done
+    return 0
+}
+
+external_display() {
+    local s
+    for s in /sys/class/drm/card*-*/status; do
+        [[ $s == *eDP* ]] && continue
+        if [[ $(rd "$s") == connected ]]; then return 0; fi
+    done
+    return 1
+}
+
+# Run a command in the active X session (DISPLAY/XAUTHORITY taken from the WM process).
+x_run() {
+    local pid user env display xauth
+    pid=$(pgrep -o -x i3 || pgrep -o -x xss-lock || true)
+    [[ -n $pid ]] || return 0
+    user=$(ps -o user= -p "$pid" | tr -d ' ')
+    env=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null || true)
+    display=$(sed -n 's/^DISPLAY=//p' <<< "$env")
+    xauth=$(sed -n 's/^XAUTHORITY=//p' <<< "$env")
+    [[ -n $display ]] || return 0
+    runuser -u "$user" -- env DISPLAY="$display" XAUTHORITY="$xauth" "$@" 2>/dev/null || true
+}
+
+set_epp() {
+    local p
+    for p in /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference; do
+        wr "$p" "$1"
+    done
+}
+
+# --- standby / wake -----------------------------------------------------------------
+
+do_standby() {
+    [[ -e $STATE ]] && return 0          # already in standby
+    local wifi epp ps
+    wifi=$(wifi_iface)
+    epp=$(rd /sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference)
+    ps=""
+    if [[ -n $wifi ]]; then
+        ps=$(iw dev "$wifi" get power_save 2>/dev/null | awk '{print $3}' || true)
+    fi
+
+    {
+        echo "time=$(date +%s)"
+        echo "charge=$(rd "$BATTERY/charge_now")"
+        echo "backlight=$(rd "$BACKLIGHT/brightness")"
+        echo "kbd=$(rd "$KBD_LED/brightness")"
+        echo "epp=$epp"
+        echo "wifi=$wifi"
+        echo "wifi_ps=$ps"
+    } > "$STATE"
+
+    wr "$BACKLIGHT/brightness" 0
+    wr "$KBD_LED/brightness" 0
+
+    if external_display; then
+        echo "docked=1" >> "$STATE"
+        jlog "standby: lid closed with external display, internal panel off only"
+        return 0
+    fi
+
+    loginctl lock-sessions 2>/dev/null || true
+    x_run xset +dpms dpms force off
+    set_epp power
+    if [[ -n $wifi ]]; then iw dev "$wifi" set power_save on 2>/dev/null || true; fi
+    jlog "standby: session locked, display off, power-save on (battery $(rd "$BATTERY/capacity")%)"
+}
+
+do_wake() {
+    local time="" charge="" backlight="" kbd="" epp="" wifi="" wifi_ps="" docked="" k v
+    if [[ -e $STATE ]]; then
+        while IFS='=' read -r k v; do
+            case $k in
+                time|charge|backlight|kbd|epp|wifi|wifi_ps|docked) printf -v "$k" '%s' "$v" ;;
+            esac
+        done < "$STATE"
+        rm -f "$STATE"
+    fi
+
+    wr "$BACKLIGHT/brightness" "${backlight:-$(( $(rd "$BACKLIGHT/max_brightness") / 2 ))}"
+    wr "$KBD_LED/brightness" "${kbd:-0}"
+    if [[ -n $docked ]]; then jlog "wake: lid opened, internal panel restored"; return 0; fi
+
+    set_epp "${epp:-balance_power}"
+    if [[ -n $wifi && -n $wifi_ps ]]; then iw dev "$wifi" set power_save "$wifi_ps" 2>/dev/null || true; fi
+    x_run xset dpms force on s reset
+
+    local msg="wake: display on, lock screen shown"
+    if [[ -n $time && -n $charge ]]; then
+        msg+=$(awk -v t0="$time" -v t1="$(date +%s)" -v c0="$charge" \
+                   -v c1="$(rd "$BATTERY/charge_now")" -v uv="$(rd "$BATTERY/voltage_now")" '
+            BEGIN {
+                dt = t1 - t0; printf " (closed %dh%02dm", dt / 3600, (dt % 3600) / 60
+                if (dt >= 60 && c1 != "" && c0 > c1)
+                    printf ", avg drain %.2f W", (c0 - c1) / 1e6 / (dt / 3600) * (uv / 1e6)
+                printf ")"
+            }')
+    fi
+    jlog "$msg"
+}
+
+# --- daemon ---------------------------------------------------------------------
+
+# Blocking reader for the lid switch input device: prints "close"/"open" per event.
+read -r -d '' LID_READER <<'EOF' || true
+import struct, sys
+EV_SW, SW_LID, FMT = 5, 0, "llHHi"
+size = struct.calcsize(FMT)
+with open(sys.argv[1], "rb", buffering=0) as f:
+    while True:
+        data = f.read(size)
+        if len(data) < size:
+            sys.exit(1)
+        _, _, etype, code, value = struct.unpack(FMT, data)
+        if etype == EV_SW and code == SW_LID:
+            print("close" if value else "open", flush=True)
+EOF
+
+cmd_daemon() {
+    local n dev="" ev
+    for n in /sys/class/input/event*/device/name; do
+        if [[ $(rd "$n") == "Lid Switch" ]]; then
+            dev="/dev/input/$(basename "$(dirname "$(dirname "$n")")")"
+            break
+        fi
+    done
+    [[ -n $dev ]] || die "Lid switch input device not found."
+    jlog "daemon: watching $dev"
+
+    case $(rd "$LID_STATE") in
+        *closed*) do_standby ;;
+        *)        if [[ -e $STATE ]]; then do_wake; fi ;;
+    esac
+
+    while read -r ev; do
+        case $ev in
+            close) do_standby ;;
+            open)  do_wake ;;
+        esac
+    done < <(python3 -u -c "$LID_READER" "$dev")
+    die "Lid reader exited."
+}
+
+# --- install ------------------------------------------------------------------
+
+write_service() {
+    cat > "$SERVICE" <<EOF
+[Unit]
+Description=MacBookPro14,3 lid-close standby (lock screen, display off, power-save)
+After=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=${SELF_DST} daemon
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_confs() {
+    mkdir -p "$(dirname "$SLEEP_CONF")" "$(dirname "$LOGIND_CONF")"
+    cat > "$SLEEP_CONF" <<'EOF'
+# Installed by mbp-suspend-fix: kernel suspend hangs on this machine, never enter it.
+[Sleep]
+AllowSuspend=no
+AllowHibernation=no
+AllowHybridSleep=no
+AllowSuspendThenHibernate=no
+EOF
+    cat > "$LOGIND_CONF" <<'EOF'
+# Installed by mbp-suspend-fix: the lid is handled by mbp-lid-standby.service.
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+EOF
+    # upowerd 1.90 has no drop-in directory; edit in place (original kept in BACKUP_DIR).
+    if [[ -f $UPOWER_CONF ]]; then
+        sed -i 's/^CriticalPowerAction=.*/CriticalPowerAction=PowerOff/' "$UPOWER_CONF"
+    fi
+}
+
+remove_old() {
+    local f
+    for f in "$OLD_SERVICE" "$LEGACY_SERVICE"; do
+        [[ -e $f ]] || continue
+        log "Removing old $(basename "$f") (backup in $BACKUP_DIR)"
+        backup "$f"
+        systemctl disable --now "$(basename "$f")" >/dev/null 2>&1 || true
+        rm -f "$f"
+    done
+    if [[ -e $OLD_HOOK ]]; then
+        log "Removing old sleep hook $OLD_HOOK"
+        backup "$OLD_HOOK"
+        rm -f "$OLD_HOOK"
+    fi
+}
+
+reload_services() {
+    systemctl daemon-reload
+    systemctl kill -s HUP systemd-logind.service   # logind reloads its config on SIGHUP
+    systemctl try-restart upower.service
+}
+
+cmd_install() {
+    require_root install
+    require_model
+    command -v python3 >/dev/null || die "python3 is required."
+
+    log "Installing ${SELF_DST}"
+    install -m 0755 "$(readlink -f "$0")" "$SELF_DST"
+
+    for f in "$SERVICE" "$SLEEP_CONF" "$LOGIND_CONF" "$UPOWER_CONF"; do backup "$f"; done
+    remove_old
+
+    log "Writing daemon service    $SERVICE";    write_service
+    log "Writing sleep/logind conf $SLEEP_CONF, $LOGIND_CONF"
+    log "Setting critical battery  CriticalPowerAction=PowerOff in $UPOWER_CONF"
+    write_confs
+
+    reload_services
+    systemctl enable "${TAG}.service" >/dev/null
+    systemctl restart "${TAG}.service"
+
+    log "Done. Close the lid: screen locks and turns off. Open it and unlock to continue."
+    log "Logs: journalctl -t ${TAG}"
+}
+
+# --- uninstall ----------------------------------------------------------------
+
+cmd_uninstall() {
+    require_root uninstall
+
+    systemctl disable --now "${TAG}.service" >/dev/null 2>&1 || true
+    if [[ -e $STATE ]]; then do_wake; fi
+    rm -f "$SERVICE" "$SLEEP_CONF" "$LOGIND_CONF"
+
+    if [[ -d $BACKUP_DIR ]]; then
+        local f
+        for f in "$BACKUP_DIR"/*; do
+            [[ -e $f ]] || continue
+            case $(basename "$f") in
+                "${TAG}.service")           cp -a "$f" "$SERVICE" ;;
+                mbp.conf)                   cp -a "$f" "$SLEEP_CONF" ;;
+                mbp-lid.conf)               cp -a "$f" "$LOGIND_CONF" ;;
+                UPower.conf)                cp -a "$f" "$UPOWER_CONF" ;;
+            esac
+        done
+    fi
+
+    reload_services
+    rm -f "$SELF_DST"
+    log "Uninstalled. Previous files restored from $BACKUP_DIR where present."
+    log "Old suspend-hook versions are kept in $BACKUP_DIR and were not restored."
+}
+
+# --- status -------------------------------------------------------------------
+
+cmd_status() {
+    local f
+    echo "Model:        $(rd /sys/class/dmi/id/product_name)"
+    echo "Lid:          $(rd "$LID_STATE" | awk '{print $2}')"
+    echo "Standby:      $( [[ -e $STATE ]] && echo active || echo no )"
+    echo "Daemon:       $(systemctl is-enabled "${TAG}.service" 2>/dev/null || true)" \
+         "/ $(systemctl is-active "${TAG}.service" 2>/dev/null || true)"
+    echo "CanSuspend:   $(busctl call org.freedesktop.login1 /org/freedesktop/login1 \
+         org.freedesktop.login1.Manager CanSuspend 2>/dev/null | awk '{print $2}') (expected \"na\")"
+    echo "Critical bat: $(sed -n 's/^CriticalPowerAction=//p' "$UPOWER_CONF" 2>/dev/null)"
+    for f in "$SERVICE" "$SLEEP_CONF" "$LOGIND_CONF"; do
+        printf '%-14s%s\n' "$( [[ -e $f ]] && echo present: || echo MISSING: )" "$f"
+    done
+    for f in "$OLD_HOOK" "$OLD_SERVICE"; do
+        if [[ -e $f ]]; then printf '%-14s%s\n' "old, remove:" "$f"; fi
+    done
+
+    echo; echo "Recent lid events:"
+    journalctl -t "$TAG" --no-pager -o short -n 6 2>/dev/null | command grep -v '^-- ' || echo "  none yet"
+}
+
+# --- main ---------------------------------------------------------------------
+
+case "${1:-}" in
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    status)    cmd_status ;;
+    standby)   require_root standby; do_standby ;;
+    wake)      require_root wake;    do_wake ;;
+    daemon)    require_root daemon;  cmd_daemon ;;
+    *)         echo "Usage: sudo $(basename "$0") {install|uninstall|status|standby|wake}"; exit 2 ;;
+esac

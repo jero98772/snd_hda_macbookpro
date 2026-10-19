@@ -1,0 +1,143 @@
+--- a/apple-ibridge.c
++++ b/apple-ibridge.c
+@@ -422,7 +422,11 @@
+ 	return appleib_forward_int_op(hdev, appleib_hid_event_fwd, &args);
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++static const __u8 *appleib_report_fixup(struct hid_device *hdev, __u8 *rdesc,
++#else
+ static __u8 *appleib_report_fixup(struct hid_device *hdev, __u8 *rdesc,
++#endif
+ 				  unsigned int *rsize)
+ {
+ 	/* Some fields have a size of 64 bits, which according to HID 1.11
+@@ -843,13 +847,18 @@
+ 	return 0;
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
++static void appleib_remove(struct acpi_device *acpi)
++#else
+ static int appleib_remove(struct acpi_device *acpi)
++#endif
+ {
+ 	struct appleib_device *ib_dev = acpi_driver_data(acpi);
+ 
+ 	hid_unregister_driver(&ib_dev->ib_driver);
+-
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+ 	return 0;
++#endif
+ }
+ 
+ static int appleib_suspend(struct device *dev)
+@@ -898,7 +907,9 @@
+ static struct acpi_driver appleib_driver = {
+ 	.name		= "apple-ibridge",
+ 	.class		= "topcase", /* ? */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+ 	.owner		= THIS_MODULE,
++#endif
+ 	.ids		= appleib_acpi_match,
+ 	.ops		= {
+ 		.add		= appleib_probe,
+--- a/apple-ib-tb.c
++++ b/apple-ib-tb.c
+@@ -40,6 +40,8 @@
+ #include <linux/usb.h>
+ #include <linux/workqueue.h>
+ 
++#include <linux/version.h>
++
+ #include "apple-ibridge.h"
+ 
+ #define HID_UP_APPLE		0xff120000
+@@ -1284,13 +1286,25 @@
+ };
+ MODULE_DEVICE_TABLE(platform, appletb_platform_ids);
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++/* platform_driver.remove returns void since 6.11 */
++static void appletb_platform_remove_void(struct platform_device *pdev)
++{
++	appletb_platform_remove(pdev);
++}
++#endif
++
+ static struct platform_driver appletb_platform_driver = {
+ 	.id_table = appletb_platform_ids,
+ 	.driver = {
+ 		.name	= "apple-ib-tb",
+ 	},
+ 	.probe = appletb_platform_probe,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++	.remove = appletb_platform_remove_void,
++#else
+ 	.remove = appletb_platform_remove,
++#endif
+ };
+ 
+ module_platform_driver(appletb_platform_driver);
+--- a/apple-ib-als.c
++++ b/apple-ib-als.c
+@@ -38,6 +38,8 @@
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ 
++#include <linux/version.h>
++
+ #include "apple-ibridge.h"
+ 
+ #define APPLEALS_DYN_SENS		0	/* our dynamic sensitivity */
+@@ -460,7 +462,11 @@
+ 	struct appleals_device **priv;
+ 	int rc;
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
++	iio_dev = iio_device_alloc(&als_dev->hid_dev->dev, sizeof(als_dev));
++#else
+ 	iio_dev = iio_device_alloc(sizeof(als_dev));
++#endif
+ 	if (!iio_dev)
+ 		return -ENOMEM;
+ 
+@@ -482,7 +488,12 @@
+ 		goto free_iio_dev;
+ 	}
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
++	iio_trig = iio_trigger_alloc(&als_dev->hid_dev->dev, "%s-dev%d",
++				     iio_dev->name, iio_device_id(iio_dev));
++#else
+ 	iio_trig = iio_trigger_alloc("%s-dev%d", iio_dev->name, iio_dev->id);
++#endif
+ 	if (!iio_trig) {
+ 		rc = -ENOMEM;
+ 		goto clean_trig_buf;
+@@ -656,13 +667,25 @@
+ };
+ MODULE_DEVICE_TABLE(platform, appleals_platform_ids);
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++/* platform_driver.remove returns void since 6.11 */
++static void appleals_platform_remove_void(struct platform_device *pdev)
++{
++	appleals_platform_remove(pdev);
++}
++#endif
++
+ static struct platform_driver appleals_platform_driver = {
+ 	.id_table = appleals_platform_ids,
+ 	.driver = {
+ 		.name	= "apple-ib-als",
+ 	},
+ 	.probe = appleals_platform_probe,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++	.remove = appleals_platform_remove_void,
++#else
+ 	.remove = appleals_platform_remove,
++#endif
+ };
+ 
+ module_platform_driver(appleals_platform_driver);
